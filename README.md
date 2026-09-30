@@ -29,19 +29,3 @@ python -m modules.training.train --training_type SpectraFeat_default  --megadept
 
 
 
-<!--
-# Citing SpectraFeat
-If you find the SpectraFeat code useful, please consider citing:
-
-```bibtex
-@article{,
-  title={SpectraFeat: Spectral Filtering and Orientation-Gated Attention for Robust Local Feature Matching},
-  author={},
-  journal={},
-  volume={},
-  pages={},
-  year={},
-  publisher={}
-}
-```  
--->
