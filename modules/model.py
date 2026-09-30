@@ -1,0 +1,186 @@
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import time
+
+from .SpectraFilter import HFP
+from .OrientGate import HoGEdgeGateConv
+from .SpectraAttn import MFMSAttentionBlock
+
+class BasicLayer(nn.Module):
+	"""
+	  Basic Convolutional Layer: Conv2d -> BatchNorm -> ReLU
+	"""
+	def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, dilation=1, bias=False):
+		super().__init__()
+		self.layer = nn.Sequential(
+									  nn.Conv2d( in_channels, out_channels, kernel_size, padding = padding, stride=stride, dilation=dilation, bias = bias),
+									  nn.BatchNorm2d(out_channels, affine=False),
+									  nn.ReLU(inplace = True),
+									)
+
+	def forward(self, x):
+	  return self.layer(x)
+
+class SpectraFeatModel(nn.Module):
+
+
+	def __init__(self):
+		super().__init__()
+		self.norm = nn.InstanceNorm2d(1)
+
+
+		########### ⬇️ CNN Backbone & Heads ⬇️ ###########
+
+		self.skip1 = nn.Sequential(	 nn.AvgPool2d(4, stride = 4),
+									 nn.Conv2d (1, 24, 1, stride = 1, padding=0) )
+
+		self.block1 = nn.Sequential(
+										BasicLayer( 1,  4, stride=1),
+										BasicLayer( 4,  8, stride=2),
+										BasicLayer( 8,  8, stride=1),
+										BasicLayer( 8, 24, stride=2),
+									)
+
+		self.block2 = nn.Sequential(
+										BasicLayer(24, 24, stride=1),
+										BasicLayer(24, 24, stride=1),
+									 )
+
+		self.block3 = nn.Sequential(
+										BasicLayer(24, 64, stride=2),
+										BasicLayer(64, 64, stride=1),
+										BasicLayer(64, 64, 1, padding=0),
+									 )
+		self.block4 = nn.Sequential(
+										BasicLayer(64, 64, stride=2),
+										BasicLayer(64, 64, stride=1),
+										BasicLayer(64, 64, stride=1),
+									 )
+
+		self.block5 = nn.Sequential(
+										BasicLayer( 64, 128, stride=2),
+										BasicLayer(128, 128, stride=1),
+										BasicLayer(128, 128, stride=1),
+										BasicLayer(128,  64, 1, padding=0),
+									 )
+
+		########### ⬇️ Plug-and-Play Enhancement Modules (Parallel with Reserve) ⬇️ ###########
+
+		# All three modules in parallel: enhance feats from the same source
+		self.mfms_attn = MFMSAttentionBlock(
+			in_channels=64,
+			scale_branches=2,
+			frequency_branches=16,
+			frequency_selection='top',
+			block_repetition=1,
+			min_channel=64,
+			min_resolution=8,
+			groups=32
+		)
+
+		self.hog_edge_conv = HoGEdgeGateConv(in_dim=64, nbins=9, cell_size=(8, 8))
+		self.hfp = HFP(in_channels=64, ratio=(0.25, 0.25), patch=(8, 8), isdct=True)
+
+		# Learnable weights for parallel fusion (with guaranteed minimum contribution)
+		self.mfms_weight = nn.Parameter(torch.tensor(0.3))
+		self.hog_weight = nn.Parameter(torch.tensor(0.3))
+		self.hfp_weight = nn.Parameter(torch.tensor(0.3))
+		self.base_weight = 0.3  # Fixed minimum contribution for each module
+
+		########### ⬇️ Fusion & Heads ⬇️ ###########
+
+		self.block_fusion =  nn.Sequential(
+										BasicLayer(64, 64, stride=1),
+										BasicLayer(64, 64, stride=1),
+										nn.Conv2d (64, 64, 1, padding=0)
+									 )
+
+		self.heatmap_head = nn.Sequential(
+										BasicLayer(64, 64, 1, padding=0),
+										BasicLayer(64, 64, 1, padding=0),
+										nn.Conv2d (64, 1, 1),
+										nn.Sigmoid()
+									)
+
+
+		self.keypoint_head = nn.Sequential(
+										BasicLayer(64, 64, 1, padding=0),
+										BasicLayer(64, 64, 1, padding=0),
+										BasicLayer(64, 64, 1, padding=0),
+										nn.Conv2d (64, 65, 1),
+									)
+
+
+  		########### ⬇️ Fine Matcher MLP ⬇️ ###########
+
+		self.fine_matcher =  nn.Sequential(
+											nn.Linear(128, 512),
+											nn.BatchNorm1d(512, affine=False),
+									  		nn.ReLU(inplace = True),
+											nn.Linear(512, 512),
+											nn.BatchNorm1d(512, affine=False),
+									  		nn.ReLU(inplace = True),
+											nn.Linear(512, 512),
+											nn.BatchNorm1d(512, affine=False),
+									  		nn.ReLU(inplace = True),
+											nn.Linear(512, 512),
+											nn.BatchNorm1d(512, affine=False),
+									  		nn.ReLU(inplace = True),
+											nn.Linear(512, 64),
+										)
+
+	def _unfold2d(self, x, ws = 2):
+		"""
+			Unfolds tensor in 2D with desired ws (window size) and concat the channels
+		"""
+		B, C, H, W = x.shape
+		x = x.unfold(2,  ws , ws).unfold(3, ws,ws)                             \
+			.reshape(B, C, H//ws, W//ws, ws**2)
+		return x.permute(0, 1, 4, 2, 3).reshape(B, -1, H//ws, W//ws)
+
+
+	def forward(self, x):
+		"""
+			input:
+				x -> torch.Tensor(B, C, H, W) grayscale or rgb images
+			return:
+				feats     ->  torch.Tensor(B, 64, H/8, W/8) dense local features
+				keypoints ->  torch.Tensor(B, 65, H/8, W/8) keypoint logit map
+				heatmap   ->  torch.Tensor(B,  1, H/8, W/8) reliability map
+
+		"""
+		#dont backprop through normalization
+		with torch.no_grad():
+			x = x.mean(dim=1, keepdim = True)
+			x = self.norm(x)
+
+		#main backbone
+		x1 = self.block1(x)
+		x2 = self.block2(x1 + self.skip1(x))
+		x3 = self.block3(x2)
+		x4 = self.block4(x3)
+		x5 = self.block5(x4)
+
+		# pyramid fusion
+		x4 = F.interpolate(x4, (x3.shape[-2], x3.shape[-1]), mode='bilinear')
+		x5 = F.interpolate(x5, (x3.shape[-2], x3.shape[-1]), mode='bilinear')
+		feats = self.block_fusion( x3 + x4 + x5 )
+
+		# Three modules in parallel: all enhance feats from the same source
+		mfms_enhanced = self.mfms_attn(feats)
+		hog_enhanced = self.hog_edge_conv(feats)
+		hfp_enhanced = self.hfp(feats)
+
+		# Weighted fusion with guaranteed minimum contribution (reserve)
+		feats = feats + (self.base_weight + self.mfms_weight) * (mfms_enhanced - feats) + \
+		             (self.base_weight + self.hog_weight) * (hog_enhanced - feats) + \
+		             (self.base_weight + self.hfp_weight) * (hfp_enhanced - feats)
+
+		#heads
+		heatmap = self.heatmap_head(feats) # Reliability map
+		keypoints = self.keypoint_head(self._unfold2d(x, ws=8)) #Keypoint map logits
+
+		return feats, keypoints, heatmap
