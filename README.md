@@ -24,7 +24,7 @@ To reproduce the training setup from the paper, please follow the steps:
 3. Finally you can call training
 ```bash
 python -m modules.training.train --training_type SpectraFeat_default  --megadepth_root_path <path_to>/MegaDepth --synthetic_root_path <path_to>/coco_20k  --ckpt_save_path /path/to/ckpts 
-
+```
 
 
 
